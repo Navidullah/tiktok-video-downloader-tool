@@ -306,7 +306,7 @@ async def download_video(
             video_data = f.read()
 
         title = info.get("title") or "tiktok_video"
-        safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_")[:50]
+       safe_title = re.sub(r"[^\w\s-]", "", title, flags=re.ASCII).strip().replace(" ", "_")[:50]
         timestamp = int(time.time())
         clean_filename = f"{safe_title or 'tiktok_video'}_{timestamp}.mp4"
 
