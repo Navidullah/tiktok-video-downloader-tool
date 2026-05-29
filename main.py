@@ -29,13 +29,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Matches desktop, mobile web, short links, and share links from the TikTok app
+# Desktop, mobile web, vm/vt app share links, and /t/ share links
 TIKTOK_URL_RE = re.compile(
     r"https?://(?:"
+    r"(?:vm|vt)\.tiktok\.com/[A-Za-z0-9]+/?|"
     r"(?:www\.|m\.)?tiktok\.com/[^\s\"\'<>]+|"
-    r"(?:vm|vt)\.tiktok\.com/[^\s\"\'<>/?#]+|"
     r"tiktok\.com/[^\s\"\'<>]+"
     r")",
+    re.IGNORECASE,
+)
+
+# vt.tiktok.com/ABC123/ and vm.tiktok.com/ABC123/ (mobile app shares)
+SHORT_TIKTOK_RE = re.compile(
+    r"^https?://(?:vm|vt)\.tiktok\.com/[A-Za-z0-9]+/?$",
+    re.IGNORECASE,
+)
+
+CANONICAL_VIDEO_RE = re.compile(
+    r"https?://(?:www\.)?tiktok\.com/@[\w.\-]+/video/\d+",
+    re.IGNORECASE,
+)
+
+HTML_CANONICAL_RE = re.compile(
+    r'<(?:meta\s+property="og:url"\s+content="|link\s+rel="canonical"\s+href=")'
+    r"(https?://[^\"']+)",
     re.IGNORECASE,
 )
 
@@ -69,6 +86,16 @@ FORMAT_MAP = {
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".mov", ".m4a")
 
 
+def normalize_input_url(raw: str) -> str:
+    """Ensure scheme and trailing slash on vt/vm short links."""
+    url = raw.strip().rstrip(".,);]\"'")
+    if not url.lower().startswith(("http://", "https://")):
+        url = f"https://{url}"
+    if SHORT_TIKTOK_RE.match(url) and not url.endswith("/"):
+        url += "/"
+    return url
+
+
 def extract_tiktok_url(raw: str) -> str:
     """Pull a TikTok URL from pasted share text or a plain link."""
     raw = raw.strip()
@@ -77,15 +104,16 @@ def extract_tiktok_url(raw: str) -> str:
 
     match = TIKTOK_URL_RE.search(raw)
     if match:
-        return match.group(0).rstrip(".,);]\"'")
+        return normalize_input_url(match.group(0))
 
-    parsed = urlparse(raw)
+    parsed = urlparse(normalize_input_url(raw))
     if parsed.netloc and is_tiktok_host(parsed.netloc):
-        return raw
+        return normalize_input_url(raw)
 
     raise ValueError(
         "No valid TikTok URL found. Supported: www.tiktok.com, m.tiktok.com, "
-        "vm.tiktok.com, vt.tiktok.com, and mobile/desktop share links."
+        "vm.tiktok.com, vt.tiktok.com (e.g. https://vt.tiktok.com/ZSxg13ny4/), "
+        "and mobile/desktop share links."
     )
 
 
@@ -94,8 +122,28 @@ def is_tiktok_host(hostname: str) -> bool:
     return host in {h.removeprefix("www.") for h in TIKTOK_HOSTS}
 
 
+def is_short_tiktok_link(url: str) -> bool:
+    return bool(SHORT_TIKTOK_RE.match(url))
+
+
+def canonical_video_url(url: str) -> str | None:
+    match = CANONICAL_VIDEO_RE.search(url)
+    if match:
+        return match.group(0).split("?")[0]
+    return None
+
+
+def find_video_url_in_html(html: str) -> str | None:
+    for match in HTML_CANONICAL_RE.finditer(html):
+        candidate = match.group(1).replace("&amp;", "&")
+        found = canonical_video_url(candidate)
+        if found:
+            return found
+    return canonical_video_url(html)
+
+
 async def resolve_tiktok_url(url: str) -> str:
-    """Follow redirects so short/mobile share links become canonical video URLs."""
+    """Follow redirects so vt/vm and other short links become canonical video URLs."""
     headers = {
         "User-Agent": MOBILE_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -110,10 +158,26 @@ async def resolve_tiktok_url(url: str) -> str:
 
     final = str(response.url)
     parsed = urlparse(final)
+
     if not is_tiktok_host(parsed.netloc):
         raise ValueError(f"Link did not resolve to TikTok (got: {parsed.netloc})")
 
-    return final.split("?")[0] if "/video/" in final or "/photo/" in final else final
+    canonical = canonical_video_url(final)
+    if canonical:
+        return canonical
+
+    canonical = find_video_url_in_html(response.text)
+    if canonical:
+        return canonical
+
+    if "/photo/" in final:
+        return final.split("?")[0]
+
+    # yt-dlp can often resolve vt/vm links directly when HTTP redirect is incomplete
+    if is_short_tiktok_link(url):
+        return url
+
+    return final.split("?")[0] if "/video/" in final else final
 
 
 def build_ydl_opts(format_selector: str, output_template: str, download: bool) -> dict:
@@ -140,6 +204,24 @@ def run_ytdlp(url: str, ydl_opts: dict) -> dict:
         return ydl.extract_info(url, download=ydl_opts.get("skip_download") is not True)
 
 
+async def run_ytdlp_with_fallback(urls: list[str], ydl_opts: dict) -> tuple[dict, str]:
+    """Try resolved URL first, then original vt/vm short link if needed."""
+    seen: set[str] = set()
+    last_error: Exception | None = None
+
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            info = await asyncio.to_thread(run_ytdlp, url, ydl_opts)
+            return info, url
+        except Exception as e:
+            last_error = e
+
+    raise last_error or RuntimeError("No URLs to download")
+
+
 def find_downloaded_file(prefix: str) -> str | None:
     candidates = [f for f in os.listdir(".") if f.startswith(prefix)]
     for ext in VIDEO_EXTENSIONS:
@@ -149,9 +231,14 @@ def find_downloaded_file(prefix: str) -> str | None:
     return candidates[0] if candidates else None
 
 
-async def prepare_url(raw_url: str) -> str:
+async def prepare_urls(raw_url: str) -> tuple[str, list[str]]:
+    """Return resolved URL and ordered list of URLs to try with yt-dlp."""
     extracted = extract_tiktok_url(raw_url)
-    return await resolve_tiktok_url(extracted)
+    resolved = await resolve_tiktok_url(extracted)
+    candidates = [resolved]
+    if extracted not in candidates:
+        candidates.append(extracted)
+    return resolved, candidates
 
 
 @app.get("/")
@@ -162,7 +249,7 @@ async def root():
             "https://www.tiktok.com/@user/video/1234567890",
             "https://m.tiktok.com/v/1234567890.html",
             "https://vm.tiktok.com/XXXXXXXX/",
-            "https://vt.tiktok.com/XXXXXXXX/",
+            "https://vt.tiktok.com/ZSxg13ny4/ (mobile app share links)",
             "https://www.tiktok.com/t/XXXXXXXX/",
             "Mobile app share text (URL is extracted automatically)",
         ],
@@ -176,14 +263,14 @@ async def root():
 @app.get("/info")
 async def video_info(url: str = Query(..., description="TikTok URL or pasted share text")):
     try:
-        resolved_url = await prepare_url(url)
-        info = await asyncio.to_thread(
-            run_ytdlp,
-            resolved_url,
+        resolved_url, candidates = await prepare_urls(url)
+        info, used_url = await run_ytdlp_with_fallback(
+            candidates,
             build_ydl_opts("best", "temp.%(ext)s", download=False),
         )
         return {
             "resolved_url": resolved_url,
+            "download_url": used_url,
             "title": info.get("title"),
             "duration": info.get("duration"),
             "uploader": info.get("uploader"),
@@ -203,13 +290,13 @@ async def download_video(
 ):
     actual_file = None
     try:
-        resolved_url = await prepare_url(url)
+        resolved_url, candidates = await prepare_urls(url)
         format_selector = FORMAT_MAP.get(format, FORMAT_MAP["best"])
         unique_id = uuid.uuid4().hex[:8]
         output_template = f"temp_{unique_id}.%(ext)s"
         ydl_opts = build_ydl_opts(format_selector, output_template, download=True)
 
-        info = await asyncio.to_thread(run_ytdlp, resolved_url, ydl_opts)
+        info, used_url = await run_ytdlp_with_fallback(candidates, ydl_opts)
         actual_file = find_downloaded_file(f"temp_{unique_id}")
 
         if not actual_file:
@@ -231,6 +318,7 @@ async def download_video(
                 "Content-Length": str(len(video_data)),
                 "Cache-Control": "no-cache",
                 "X-Resolved-Url": resolved_url,
+                "X-Download-Url": used_url,
             },
         )
     except ValueError as e:
