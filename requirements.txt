@@ -4,3 +4,4 @@ yt-dlp>=2025.1.15
 httpx==0.28.1
 python-multipart==0.0.20
 python-dotenv==1.0.1
+# Note: /download/audio requires ffmpeg to be installed on the system (not a pip package)
